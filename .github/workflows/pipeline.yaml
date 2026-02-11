@@ -20,7 +20,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Debug: proves whether infra/ exists at repo root (fix path if it doesn't)
       - name: Debug repo structure
         run: |
           echo "PWD=$(pwd)"
@@ -41,7 +40,7 @@ jobs:
 
       - name: Terraform init
         working-directory: infra
-        run: terraform init -input=true
+        run: terraform init -input=false
 
       - name: Terraform validate
         working-directory: infra
