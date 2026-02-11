@@ -1,147 +1,175 @@
-data "aws_availability_zones" "available" {}
+name: Infra + Deploy (EKS/ECR/S3/EC2)
 
-locals {
-  azs = slice(data.aws_availability_zones.available.names, 0, 2)
-}
+on:
+  push:
+    branches: ["main"]
 
-# -------------------------
-# VPC
-# -------------------------
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "5.13.0"
+permissions:
+  contents: read
+  id-token: write
 
-  name = "${var.name_prefix}-vpc"
-  cidr = "10.10.0.0/16"
+env:
+  AWS_REGION: eu-north-1
+  TF_VERSION: 1.6.6
 
-  azs             = local.azs
-  public_subnets  = ["10.10.1.0/24", "10.10.2.0/24"]
-  private_subnets = ["10.10.11.0/24", "10.10.12.0/24"]
+jobs:
+  infra:
+    runs-on: ubuntu-latest
 
-  enable_nat_gateway = true
-  single_nat_gateway = true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-  enable_dns_hostnames = true
-  enable_dns_support   = true
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-  tags = {
-    Project = var.name_prefix
-  }
-}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-# -------------------------
-# ECR
-# -------------------------
-resource "aws_ecr_repository" "app" {
-  name                 = "${var.name_prefix}-app"
-  image_tag_mutability = "MUTABLE"
-}
+      - name: Detect Terraform directory
+        id: tfdir
+        run: |
+          set -e
+          TF_DIR=$(find . -maxdepth 6 -type f -name "*.tf" -print | head -n 1 | xargs -I{} dirname "{}")
+          if [ -z "$TF_DIR" ]; then
+            echo "ERROR: No *.tf files found in repo (depth 6)."
+            exit 1
+          fi
+          TF_DIR="${TF_DIR#./}"
+          echo "TF_DIR=$TF_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using TF_DIR=$TF_DIR"
+          ls -la "$TF_DIR"
 
-# -------------------------
-# S3 (app bucket, not tfstate bucket)
-# -------------------------
-resource "aws_s3_bucket" "app" {
-  bucket = var.app_bucket_name
+      - name: Terraform init
+        run: |
+          set -e
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
+          terraform init -input=false
 
-  tags = {
-    Name    = "${var.name_prefix}-app-bucket"
-    Project = var.name_prefix
-  }
-}
+      # ✅ FIX for RepositoryAlreadyExists / LogGroupAlreadyExists / KMS alias already exists
+      - name: Import existing AWS resources (only if missing in state)
+        run: |
+          set -e
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
 
-resource "aws_s3_bucket_versioning" "app" {
-  bucket = aws_s3_bucket.app.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
+          NAME_PREFIX="ci-eks"                 # must match your -var name_prefix
+          ECR_NAME="${NAME_PREFIX}-app"        # matches aws_ecr_repository.app name in your TF
+          CLUSTER_NAME="${NAME_PREFIX}-eks"    # matches module.eks.cluster_name in your TF
+          LOG_GROUP="/aws/eks/${CLUSTER_NAME}/cluster"
+          KMS_ALIAS="alias/eks/${CLUSTER_NAME}"
 
-resource "aws_s3_bucket_public_access_block" "app" {
-  bucket = aws_s3_bucket.app.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
+          echo "ECR_NAME=$ECR_NAME"
+          echo "CLUSTER_NAME=$CLUSTER_NAME"
+          echo "LOG_GROUP=$LOG_GROUP"
+          echo "KMS_ALIAS=$KMS_ALIAS"
 
-# -------------------------
-# EKS
-# -------------------------
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "20.24.2"
+          # ECR
+          terraform state show aws_ecr_repository.app >/dev/null 2>&1 || \
+            (echo "Importing ECR..." && terraform import aws_ecr_repository.app "$ECR_NAME") || true
 
-  cluster_name    = "${var.name_prefix}-eks"
-  cluster_version = "1.29"
+          # CloudWatch Log Group (created by EKS module)
+          terraform state show 'module.eks.aws_cloudwatch_log_group.this[0]' >/dev/null 2>&1 || \
+            (echo "Importing Log Group..." && terraform import 'module.eks.aws_cloudwatch_log_group.this[0]' "$LOG_GROUP") || true
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
+          # KMS Alias (created inside module.eks.module.kms)
+          terraform state show 'module.eks.module.kms.aws_kms_alias.this["cluster"]' >/dev/null 2>&1 || \
+            (echo "Importing KMS Alias..." && terraform import 'module.eks.module.kms.aws_kms_alias.this["cluster"]' "$KMS_ALIAS") || true
 
-  cluster_endpoint_public_access = true
+      - name: Terraform validate
+        run: |
+          set -e
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
+          terraform validate
 
-  eks_managed_node_groups = {
-    default = {
-      name           = "${var.name_prefix}-ng"
-      instance_types = ["t3.medium"]
-      min_size       = 1
-      max_size       = 2
-      desired_size   = 1
-    }
-  }
+      - name: Terraform apply
+        run: |
+          set -e
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
+          terraform apply -auto-approve \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="name_prefix=ci-eks" \
+            -var="app_bucket_name=ci-eks-app-bucket-149916142098" \
+            -var="ec2_ami_id=ami-04233b5aecce09244"
 
-  tags = {
-    Project = var.name_prefix
-  }
-}
+      - name: Export Terraform outputs
+        run: |
+          set -e
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
+          terraform output -json > "${GITHUB_WORKSPACE}/outputs.json"
+          ls -la "${GITHUB_WORKSPACE}/outputs.json"
 
-# -------------------------
-# EC2 (optional utility/bastion)
-# -------------------------
-resource "aws_security_group" "ec2" {
-  name        = "${var.name_prefix}-ec2-sg"
-  description = "Allow SSH and HTTP"
-  vpc_id      = module.vpc.vpc_id
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs
+          path: outputs.json
 
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_ssh_cidr]
-  }
+  deploy:
+    runs-on: ubuntu-latest
+    needs: infra
 
-  ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-  egress {
-    description = "All outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-  tags = {
-    Project = var.name_prefix
-  }
-}
+      - name: Download outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: tf-outputs
+          path: .
 
-resource "aws_instance" "utility" {
-  ami                    = var.ec2_ami_id
-  instance_type          = var.ec2_instance_type
-  subnet_id              = module.vpc.public_subnets[0]
-  vpc_security_group_ids = [aws_security_group.ec2.id]
-  associate_public_ip_address = true
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
-  key_name = var.ec2_key_name != "" ? var.ec2_key_name : null
+      - name: Read outputs
+        id: out
+        run: |
+          set -e
+          test -f outputs.json
+          echo "ECR_REPO_URL=$(jq -r .ecr_repo_url.value outputs.json)" >> $GITHUB_OUTPUT
+          echo "CLUSTER_NAME=$(jq -r .cluster_name.value outputs.json)" >> $GITHUB_OUTPUT
 
-  tags = {
-    Name    = "${var.name_prefix}-utility-ec2"
-    Project = var.name_prefix
-  }
-}
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: img
+        run: |
+          set -e
+          IMAGE="${{ steps.out.outputs.ECR_REPO_URL }}:${{ github.sha }}"
+          docker build -t "$IMAGE" app
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
+      - name: Update kubeconfig
+        run: |
+          set -e
+          aws eks update-kubeconfig \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ steps.out.outputs.CLUSTER_NAME }}"
+
+      - name: Deploy to EKS
+        run: |
+          set -e
+          sed -i "s|REPLACE_IMAGE|${{ steps.img.outputs.IMAGE }}|g" app/k8s/deployment.yaml
+          kubectl apply -f app/k8s/deployment.yaml
+          kubectl apply -f app/k8s/service.yaml
+          kubectl rollout status deployment/web

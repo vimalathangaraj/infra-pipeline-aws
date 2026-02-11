@@ -1,17 +1,3 @@
-name: Infra + Deploy (EKS/ECR/S3/EC2)
-
-on:
-  push:
-    branches: ["main"]
-
-permissions:
-  contents: read
-  id-token: write
-
-env:
-  AWS_REGION: eu-north-1
-  TF_VERSION: 1.6.6
-
 jobs:
   infra:
     runs-on: ubuntu-latest
@@ -24,12 +10,12 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: eu-north-1
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          terraform_version: 1.6.6
 
       - name: Detect Terraform directory
         id: tfdir
@@ -37,35 +23,91 @@ jobs:
           set -e
           TF_DIR=$(find . -maxdepth 6 -type f -name "*.tf" -print | head -n 1 | xargs -I{} dirname "{}")
           if [ -z "$TF_DIR" ]; then
-            echo "ERROR: No *.tf files found in repo (depth 6)."
-            echo "Make sure you committed your terraform code."
+            echo "ERROR: No *.tf files found (depth 6)."
             exit 1
           fi
           TF_DIR="${TF_DIR#./}"
           echo "TF_DIR=$TF_DIR" >> "$GITHUB_OUTPUT"
           echo "Using TF_DIR=$TF_DIR"
+          ls -la "$TF_DIR"
 
-      - name: Terraform init
+      - name: Terraform init (reconfigure backend)
         run: |
+          set -e
           cd "${{ steps.tfdir.outputs.TF_DIR }}"
-          terraform init -input=false
+          terraform init -input=false -reconfigure
 
-      - name: Terraform validate
+      - name: Show state list (before import)
         run: |
+          set -e
           cd "${{ steps.tfdir.outputs.TF_DIR }}"
-          terraform validate
+          terraform state list || true
+
+      - name: Import + Verify existing resources (ECR / LogGroup / KMS Alias)
+        run: |
+          set -e
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
+
+          NAME_PREFIX="ci-eks"
+          ECR_NAME="${NAME_PREFIX}-app"
+          CLUSTER_NAME="${NAME_PREFIX}-eks"
+          LOG_GROUP="/aws/eks/${CLUSTER_NAME}/cluster"
+          KMS_ALIAS="alias/eks/${CLUSTER_NAME}"
+
+          echo "ECR_NAME=$ECR_NAME"
+          echo "CLUSTER_NAME=$CLUSTER_NAME"
+          echo "LOG_GROUP=$LOG_GROUP"
+          echo "KMS_ALIAS=$KMS_ALIAS"
+
+          echo "==== BEFORE IMPORT (state list) ===="
+          terraform state list || true
+
+          # Import ECR
+          if ! terraform state show aws_ecr_repository.app >/dev/null 2>&1; then
+            echo "Importing ECR repo..."
+            terraform import aws_ecr_repository.app "$ECR_NAME"
+          else
+            echo "ECR already in state"
+          fi
+
+          # Import CloudWatch Log Group (created by EKS module)
+          if ! terraform state show 'module.eks.aws_cloudwatch_log_group.this[0]' >/dev/null 2>&1; then
+            echo "Importing Log Group..."
+            terraform import 'module.eks.aws_cloudwatch_log_group.this[0]' "$LOG_GROUP"
+          else
+            echo "Log group already in state"
+          fi
+
+          # Import KMS Alias (created by nested kms module)
+          if ! terraform state show 'module.eks.module.kms.aws_kms_alias.this["cluster"]' >/dev/null 2>&1; then
+            echo "Importing KMS Alias..."
+            terraform import 'module.eks.module.kms.aws_kms_alias.this["cluster"]' "$KMS_ALIAS"
+          else
+            echo "KMS alias already in state"
+          fi
+
+          echo "==== AFTER IMPORT (state list) ===="
+          terraform state list
+
+          echo "==== VERIFY (must exist in state) ===="
+          terraform state show aws_ecr_repository.app >/dev/null
+          terraform state show 'module.eks.aws_cloudwatch_log_group.this[0]' >/dev/null
+          terraform state show 'module.eks.module.kms.aws_kms_alias.this["cluster"]' >/dev/null
+          echo "OK: imports are in state"
 
       - name: Terraform apply
         run: |
+          set -e
           cd "${{ steps.tfdir.outputs.TF_DIR }}"
           terraform apply -auto-approve \
-            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="aws_region=eu-north-1" \
             -var="name_prefix=ci-eks" \
             -var="app_bucket_name=ci-eks-app-bucket-149916142098" \
             -var="ec2_ami_id=ami-04233b5aecce09244"
 
       - name: Export Terraform outputs
         run: |
+          set -e
           cd "${{ steps.tfdir.outputs.TF_DIR }}"
           terraform output -json > "${GITHUB_WORKSPACE}/outputs.json"
 
@@ -74,64 +116,3 @@ jobs:
         with:
           name: tf-outputs
           path: outputs.json
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: infra
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure AWS (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Download outputs
-        uses: actions/download-artifact@v4
-        with:
-          name: tf-outputs
-          path: .
-
-      - name: Install jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
-      - name: Read outputs
-        id: out
-        run: |
-          test -f outputs.json
-          echo "ECR_REPO_URL=$(jq -r .ecr_repo_url.value outputs.json)" >> $GITHUB_OUTPUT
-          echo "CLUSTER_NAME=$(jq -r .cluster_name.value outputs.json)" >> $GITHUB_OUTPUT
-
-      - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and push image
-        id: img
-        run: |
-          IMAGE="${{ steps.out.outputs.ECR_REPO_URL }}:${{ github.sha }}"
-          docker build -t "$IMAGE" app
-          docker push "$IMAGE"
-          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
-
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: "v1.29.0"
-
-      - name: Update kubeconfig
-        run: |
-          aws eks update-kubeconfig \
-            --region "${{ env.AWS_REGION }}" \
-            --name "${{ steps.out.outputs.CLUSTER_NAME }}"
-
-      - name: Deploy to EKS
-        run: |
-          sed -i "s|REPLACE_IMAGE|${{ steps.img.outputs.IMAGE }}|g" app/k8s/deployment.yaml
-          kubectl apply -f app/k8s/deployment.yaml
-          kubectl apply -f app/k8s/service.yaml
-          kubectl rollout status deployment/web
