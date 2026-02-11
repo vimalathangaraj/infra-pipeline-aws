@@ -31,47 +31,31 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # ✅ Key fix: discover terraform directory instead of assuming ./infra exists
       - name: Detect Terraform directory
         id: tfdir
-        shell: bash
         run: |
-          echo "Repo root: $(pwd)"
-          echo "Top-level files/dirs:"
-          ls -la
-
-          # Find first directory (closest) that contains .tf files
-          TF_DIR="$(find . -maxdepth 6 -type f -name '*.tf' -print0 | xargs -0 -n1 dirname | sort -u | head -n1)"
-
+          set -e
+          TF_DIR=$(find . -maxdepth 6 -type f -name "*.tf" -print | head -n 1 | xargs -I{} dirname "{}")
           if [ -z "$TF_DIR" ]; then
-            echo "ERROR: No Terraform (*.tf) files found in repo (searched depth 6)."
-            echo "Fix: commit your terraform code to the repo OR update workflow to point to correct folder."
+            echo "ERROR: No *.tf files found in repo (depth 6)."
+            echo "Make sure you committed your terraform code."
             exit 1
           fi
-
-          # Normalize (remove leading ./)
           TF_DIR="${TF_DIR#./}"
-
-          echo "Detected Terraform directory: $TF_DIR"
           echo "TF_DIR=$TF_DIR" >> "$GITHUB_OUTPUT"
-
-          echo "Listing TF_DIR:"
-          ls -la "$TF_DIR"
+          echo "Using TF_DIR=$TF_DIR"
 
       - name: Terraform init
-        shell: bash
         run: |
           cd "${{ steps.tfdir.outputs.TF_DIR }}"
           terraform init -input=false
 
       - name: Terraform validate
-        shell: bash
         run: |
           cd "${{ steps.tfdir.outputs.TF_DIR }}"
           terraform validate
 
       - name: Terraform apply
-        shell: bash
         run: |
           cd "${{ steps.tfdir.outputs.TF_DIR }}"
           terraform apply -auto-approve \
@@ -81,7 +65,6 @@ jobs:
             -var="ec2_ami_id=ami-04233b5aecce09244"
 
       - name: Export Terraform outputs
-        shell: bash
         run: |
           cd "${{ steps.tfdir.outputs.TF_DIR }}"
           terraform output -json > "${GITHUB_WORKSPACE}/outputs.json"
@@ -113,12 +96,14 @@ jobs:
           path: .
 
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Read outputs
         id: out
         run: |
-          test -f outputs.json || (echo "ERROR: outputs.json missing" && ls -la && exit 1)
+          test -f outputs.json
           echo "ECR_REPO_URL=$(jq -r .ecr_repo_url.value outputs.json)" >> $GITHUB_OUTPUT
           echo "CLUSTER_NAME=$(jq -r .cluster_name.value outputs.json)" >> $GITHUB_OUTPUT
 
