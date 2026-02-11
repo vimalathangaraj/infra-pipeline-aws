@@ -20,13 +20,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Debug repo structure
-        run: |
-          echo "PWD=$(pwd)"
-          ls -la
-          echo "---- infra dir ----"
-          ls -la infra || true
-
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -38,17 +31,49 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      # ✅ Key fix: discover terraform directory instead of assuming ./infra exists
+      - name: Detect Terraform directory
+        id: tfdir
+        shell: bash
+        run: |
+          echo "Repo root: $(pwd)"
+          echo "Top-level files/dirs:"
+          ls -la
+
+          # Find first directory (closest) that contains .tf files
+          TF_DIR="$(find . -maxdepth 6 -type f -name '*.tf' -print0 | xargs -0 -n1 dirname | sort -u | head -n1)"
+
+          if [ -z "$TF_DIR" ]; then
+            echo "ERROR: No Terraform (*.tf) files found in repo (searched depth 6)."
+            echo "Fix: commit your terraform code to the repo OR update workflow to point to correct folder."
+            exit 1
+          fi
+
+          # Normalize (remove leading ./)
+          TF_DIR="${TF_DIR#./}"
+
+          echo "Detected Terraform directory: $TF_DIR"
+          echo "TF_DIR=$TF_DIR" >> "$GITHUB_OUTPUT"
+
+          echo "Listing TF_DIR:"
+          ls -la "$TF_DIR"
+
       - name: Terraform init
-        working-directory: infra
-        run: terraform init -input=false
+        shell: bash
+        run: |
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
+          terraform init -input=false
 
       - name: Terraform validate
-        working-directory: infra
-        run: terraform validate
+        shell: bash
+        run: |
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
+          terraform validate
 
       - name: Terraform apply
-        working-directory: infra
+        shell: bash
         run: |
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
           terraform apply -auto-approve \
             -var="aws_region=${{ env.AWS_REGION }}" \
             -var="name_prefix=ci-eks" \
@@ -56,8 +81,10 @@ jobs:
             -var="ec2_ami_id=ami-04233b5aecce09244"
 
       - name: Export Terraform outputs
-        working-directory: infra
-        run: terraform output -json > ../outputs.json
+        shell: bash
+        run: |
+          cd "${{ steps.tfdir.outputs.TF_DIR }}"
+          terraform output -json > "${GITHUB_WORKSPACE}/outputs.json"
 
       - name: Upload outputs
         uses: actions/upload-artifact@v4
@@ -91,6 +118,7 @@ jobs:
       - name: Read outputs
         id: out
         run: |
+          test -f outputs.json || (echo "ERROR: outputs.json missing" && ls -la && exit 1)
           echo "ECR_REPO_URL=$(jq -r .ecr_repo_url.value outputs.json)" >> $GITHUB_OUTPUT
           echo "CLUSTER_NAME=$(jq -r .cluster_name.value outputs.json)" >> $GITHUB_OUTPUT
 
